@@ -150,19 +150,31 @@ type Pool struct {
 	// for a connection to be returned to the pool before returning.
 	Wait bool
 
+	// Allow new connections to be deferred in favor of newly idle connections
+	DeferNewConnections bool
+
 	// mu protects fields defined below.
-	mu     sync.Mutex
-	cond   *sync.Cond
-	closed bool
-	active int
+	mu                   sync.Mutex
+	cond                 *sync.Cond
+	closed               bool
+	active               int
+	deferredDialsPending int
+	waiting              int
 
 	// Stack of idleConn with most recently used at the front.
 	idle list.List
+
+	deferredNewConns chan deferredNewConn
 }
 
 type idleConn struct {
+	c              Conn
+	t              time.Time
+}
+
+type deferredNewConn struct {
 	c Conn
-	t time.Time
+	err error
 }
 
 // NewPool creates a new pool.
@@ -272,24 +284,53 @@ func (p *Pool) get() (Conn, error) {
 		}
 	}
 
-	for {
-		// Get idle connection.
+	hasDialedConn := false
 
-		for i, n := 0, p.idle.Len(); i < n; i++ {
-			e := p.idle.Front()
-			if e == nil {
-				break
+	for {
+
+		if p.DeferNewConnections {
+			if p.deferredNewConns == nil {
+				p.deferredNewConns = make(chan deferredNewConn, 1)
 			}
-			ic := e.Value.(idleConn)
-			p.idle.Remove(e)
-			test := p.TestOnBorrow
-			p.mu.Unlock()
-			if test == nil || test(ic.c, ic.t) == nil {
-				return ic.c, nil
+
+			if p.cond == nil {
+				p.cond = sync.NewCond(&p.mu)
 			}
-			ic.c.Close()
-			p.mu.Lock()
-			p.release()
+
+			// Grab a new connection (or error) if one is available
+			select {
+			case deferredNewConn := <-p.deferredNewConns:
+				p.cond.Signal()  // There may be more so wake up another thread
+				p.mu.Unlock()
+				// TODO: consider skipping the error if there is something else in the channel
+				return deferredNewConn.c, deferredNewConn.err
+			default:
+			}
+		}
+
+		// Get idle connection.
+		if p.idle.Len() > 0 {
+			for {
+				e := p.idle.Front()
+				if e == nil {
+					break
+				}
+				ic := e.Value.(idleConn)
+				p.idle.Remove(e)
+				test := p.TestOnBorrow
+				p.mu.Unlock()
+				if test == nil || test(ic.c, ic.t) == nil {
+					return ic.c, nil
+				}
+				ic.c.Close()
+				p.mu.Lock()
+				p.release()
+			}
+
+			if p.DeferNewConnections {
+				// Go back to the top and check for anything that might be queued before sleeping
+				continue
+			}
 		}
 
 		// Check for pool closed before dialing a new connection.
@@ -302,20 +343,44 @@ func (p *Pool) get() (Conn, error) {
 		// Dial new connection if under limit.
 
 		if p.MaxActive == 0 || p.active < p.MaxActive {
-			dial := p.Dial
-			p.active += 1
-			p.mu.Unlock()
-			c, err := dial()
-			if err != nil {
-				p.mu.Lock()
-				p.release()
-				p.mu.Unlock()
-				c = nil
+
+			// Don't allow more deferred dials than outstanding callers
+			if p.deferredDialsPending <= p.waiting {
+				p.active += 1
+				hasDialedConn = true
+				dial := p.Dial
+				createConn := func() (Conn, error) {
+					c, err := dial()
+					if err != nil {
+						p.mu.Lock()
+						p.release()
+						p.mu.Unlock()
+						c = nil
+					}
+					return c, err
+				}
+
+				if p.DeferNewConnections {
+					p.deferredDialsPending += 1
+					go func() {
+						c, err := createConn()
+
+						p.deferredNewConns <- deferredNewConn{c: c, err: err}
+
+						// Force all callers into the condition variable wait before signaling so we're sure they get to look at the channel
+						p.mu.Lock()
+						p.deferredDialsPending -= 1
+						p.cond.Signal()
+						p.mu.Unlock()
+					}()
+				} else {
+					p.mu.Unlock()
+					return createConn()
+				}
 			}
-			return c, err
 		}
 
-		if !p.Wait {
+		if !p.Wait && !hasDialedConn {
 			p.mu.Unlock()
 			return nil, ErrPoolExhausted
 		}
@@ -323,7 +388,10 @@ func (p *Pool) get() (Conn, error) {
 		if p.cond == nil {
 			p.cond = sync.NewCond(&p.mu)
 		}
+
+		p.waiting += 1
 		p.cond.Wait()
+		p.waiting -= 1
 	}
 }
 
